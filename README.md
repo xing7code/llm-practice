@@ -11,12 +11,12 @@ A full transformer implementation with:
 - Top-k / top-p sampling
 - Flash attention (online softmax, block-sparse)
 - Tensor parallelism (TP) + sequence parallelism (SP)
-- Context parallelism via ring attention (causal, zigzag-balanced)
+- Context parallelism via ring attention (causal, unbalanced, TODO: try zigzag)
+- Pipeline parallelism (1F1B schedule)
 
 ## Roadmap
 
 - [ ] Data parallelism (DDP)
-- [ ] Pipeline parallelism (1F1B schedule)
 - [ ] Mixture of Experts (MoE)
 - [ ] Expert parallelism (EP)
 - [ ] ZeRO-1 / ZeRO-2 / ZeRO-3
