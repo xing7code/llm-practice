@@ -4,10 +4,17 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from dataclasses import dataclass
 
-def generate_rope(max_seq_len, head_dim):
+def generate_rope(max_seq_len, head_dim, cp_group):
   base = 10000
   theta = 1.0/(base**(torch.arange(0, head_dim, 2).float()/head_dim))
-  seq = torch.arange(max_seq_len)
+  if cp_group is not None:
+    world_size = dist.get_world_size(cp_group)
+    rank = dist.get_rank(cp_group)
+    assert max_seq_len % world_size == 0, "current CP assume max_seq_len dividable by world_size"
+    per_rank_seq = max_seq_len // world_size
+    seq = torch.arange(rank*per_rank_seq, (rank+1)*per_rank_seq)
+  else:
+    seq = torch.arange(max_seq_len)
   freq = torch.outer(seq, theta)
   return torch.cos(freq), torch.sin(freq)
 
@@ -291,7 +298,7 @@ class Transformer(nn.Module):
     self.mp = mp
     self.embed = nn.Embedding(config.vocab_size, config.model_dim)
     head_dim = config.model_dim // config.n_heads
-    cos, sin = generate_rope(config.max_seq_len, head_dim)
+    cos, sin = generate_rope(config.max_seq_len, head_dim, mp.cp_group)
     self.register_buffer("cos", cos)
     self.register_buffer("sin", sin)
     self.layers = nn.ModuleList([
