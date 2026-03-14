@@ -367,3 +367,167 @@ class Transformer(nn.Module):
       next_token = self._sample_next_token(logits, sampling_config)
       generated_tokens.append(next_token)
     return torch.cat(generated_tokens, dim=-1)
+
+
+###### Pipeline Parallelism: 1F1B, run example:
+# stage = TransformerStage(config, mp)
+# scheduler = PipeScheduler(stage, num_micro_batches)
+# loss = nn.CrossEntropyLoss()
+# optimizer = optim.AdamW(stage.parameters(), lr=1e-4)
+
+# def loss_fn(input, target):
+#   vocab_size = input.size(-1)
+#   input = input.view(-1, vocab_size)
+#   target = target.view(-1)
+#   return loss(input, target)
+
+# for x, y in dataloader:
+#   x, y = x.to(device), y.to(device)              
+#   xs = x.split(x.size(0)//num_micro_batches, dim=0)
+#   ys = y.split(x.size(0)//num_micro_batches, dim=0)
+#   optimizer.zero_grad()
+#   scheduler.run(xs, ys, loss_fn)
+#   optimizer.step()
+
+class TransformerStage(nn.Module):
+  def __init__(self, config: ModelConfig, mp: ModelParal):
+    super().__init__()
+    self.config = config
+    self.mp = mp
+    assert mp.pp_group is not None, "TransformerStage is for pipeline parallelism."
+    self.world_size = dist.get_world_size(mp.pp_group)
+    self.rank = dist.get_rank(mp.pp_group)
+    n_layers_per_stage = config.num_layers//self.world_size
+    if self.rank == 0:
+      self.embed = nn.Embedding(config.vocab_size, config.model_dim)
+      num_blocks = n_layers_per_stage-1
+    elif self.rank == self.world_size-1:
+      num_blocks = n_layers_per_stage-1
+      self.lm_head = nn.Linear(config.model_dim, config.vocab_size, bias=False)
+      Norm = RmsNorm if config.norm_type=="rms" else LayerNorm
+      self.norm = Norm(config.model_dim, config.norm_eps)
+    else:
+      m = (config.num_layers-2*n_layers_per_stage+2) % (self.world_size-2)
+      if self.rank<=m:
+        num_blocks = n_layers_per_stage+1
+      else:
+        num_blocks = n_layers_per_stage
+    self.layers = nn.ModuleList([
+        TransformerBlock(config, mp) for _ in range(num_blocks)
+    ])
+    head_dim = config.model_dim // config.n_heads
+    cos, sin = generate_rope(config.max_seq_len, head_dim, self.mp.cp_group)
+    self.register_buffer("cos", cos)
+    self.register_buffer("sin", sin)
+
+  def forward(self, x, causal, kv_cache):
+    if hasattr(self, "embed"):
+      x = self.embed(x)
+    start_pos = 0
+    if self.mp.tp_group and self.mp.use_sp:
+      world_size = dist.get_world_size(self.mp.tp_group)
+      rank = dist.get_rank(self.mp.tp_group)
+      seq_per_rank = x.size(1)//world_size
+      x = x[:, rank*seq_per_rank : (rank+1)*seq_per_rank]
+      start_pos += rank*seq_per_rank
+    if kv_cache:
+      start_pos += kv_cache[0][0].size(2)
+    else:
+      kv_cache = [None] * len(self.layers)
+    cos = self.cos[start_pos:start_pos+x.size(1)].unsqueeze(0).unsqueeze(0)
+    sin = self.sin[start_pos:start_pos+x.size(1)].unsqueeze(0).unsqueeze(0)
+    new_kv_cache = []
+    for i, layer in enumerate(self.layers):
+      x, cache = layer(x, cos, sin, causal, kv_cache[i])
+      new_kv_cache.append(cache)
+    if self.rank == self.world_size-1:
+      assert hasattr(self, "norm") and hasattr(self, "lm_head"), "last stage must have norm and lm_head"
+      x = self.norm(x)
+      if self.mp.tp_group and self.mp.use_sp:
+        x = gather_seq(x, self.mp.tp_group)
+      x = self.lm_head(x)
+    return x, new_kv_cache
+
+
+class PipeScheduler:
+  def __init__(self, stage: TransformerStage, num_micro_batches: int):
+    self.stage = stage
+    self.stage_idx = stage.rank
+    self.num_stages = stage.world_size
+    self.group = stage.mp.pp_group
+    self.num_micro_batches = num_micro_batches
+    self.num_warmup_batches = min(num_micro_batches, self.num_stages - self.stage_idx -1)
+
+    self.buffers = deque()
+
+    self.total_loss = []
+
+  def _forward(self, x, y, buffer, op, loss_fn):
+    if self.stage_idx>0:
+      assert op is not None
+      op.wait()
+      x = buffer.clone()
+      x.requires_grad_(True)
+    out, _ = self.stage(x, causal=True, kv_cache=None)
+    
+    if self.stage_idx < self.num_stages-1:
+      dist.isend(out.detach(), self.stage_idx+1, self.group)
+      self.buffers.append((x, out))
+    else:
+      loss = loss_fn(out, y)
+      self.buffers.append((x, loss))
+      self.total_loss.append(loss.detach())
+
+  def _backward(self, buffer, op):
+    input, output_or_loss = self.buffers.popleft()
+    if self.stage_idx == self.num_stages-1:
+      output_or_loss.backward()
+    else:
+      assert op is not None
+      op.wait()
+      torch.autograd.backward(output_or_loss, grad_tensors=buffer)
+    if self.stage_idx > 0:
+      dist.isend(input.grad, self.stage_idx-1, self.group)
+    
+  def run(self, micro_batches, micro_targets, loss_fn):
+    self.total_loss = []
+    batch_idx = 0
+    b, s = micro_batches[batch_idx].size()
+    dtype, device = next(self.stage.parameters()).dtype, micro_batches[batch_idx].device
+    fwd_buffer = torch.empty((b, s, self.stage.config.model_dim), dtype=dtype, device=device)
+    bwd_buffer = torch.empty((b, s, self.stage.config.model_dim), dtype=dtype, device=device)
+    fwd_op, bwd_op = None, None
+
+    def maybe_irecv_for_fwd():
+      nonlocal fwd_op
+      if self.stage_idx>0:
+        fwd_op = dist.irecv(fwd_buffer, self.stage_idx-1, self.group)
+
+    def maybe_irecv_for_bwd():
+      nonlocal bwd_op
+      if self.stage_idx<self.num_stages-1:
+        bwd_op = dist.irecv(bwd_buffer, self.stage_idx+1, self.group)
+
+    while batch_idx < self.num_warmup_batches:
+      maybe_irecv_for_fwd()
+      self._forward(micro_batches[batch_idx], micro_targets[batch_idx], fwd_buffer, fwd_op, loss_fn)
+      batch_idx += 1
+
+    maybe_irecv_for_fwd()
+    while batch_idx < self.num_micro_batches:
+      maybe_irecv_for_bwd()
+      self._forward(micro_batches[batch_idx], micro_targets[batch_idx], fwd_buffer, fwd_op, loss_fn)
+
+      if batch_idx < self.num_micro_batches-1:
+        maybe_irecv_for_fwd()
+      self._backward(bwd_buffer, bwd_op)
+      batch_idx += 1
+
+    while self.buffers:
+      maybe_irecv_for_bwd()
+      self._backward(bwd_buffer, bwd_op)
+
+    loss = None
+    if self.stage_idx == self.num_stages-1:
+      loss = torch.stack(self.total_loss).mean()
+    return loss
