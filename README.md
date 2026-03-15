@@ -14,9 +14,13 @@ A full transformer implementation with:
 - Context parallelism via ring attention (causal, unbalanced, TODO: try zigzag)
 - Pipeline parallelism (1F1B schedule)
 
+### `ddp.py`
+- Grads are accumulated in buckets during backward.
+- Bucket contain params in backward order.
+- Bucket fires async all-reduce when all its params grad updated.
+
 ## Roadmap
 
-- [ ] Data parallelism (DDP)
 - [ ] Mixture of Experts (MoE)
 - [ ] Expert parallelism (EP)
 - [ ] ZeRO-1 / ZeRO-2 / ZeRO-3
